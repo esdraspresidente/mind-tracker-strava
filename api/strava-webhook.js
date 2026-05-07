@@ -4,20 +4,24 @@ const STRAVA_CLIENT_ID = '237128';
 const STRAVA_CLIENT_SECRET = '9cf562eff1fadba8b7bdb49c6af0d905b361bdc8';
 const WEBHOOK_VERIFY_TOKEN = 'mindtracker2026';
 
-// Tipos de atividade Strava → modalidade Mind Tracker
 function mapAtividade(type) {
-  const map = {
-    'Run': 'corrida',
-    'Walk': 'caminhada',
-    'Ride': 'bike',
-    'Swim': 'natacao',
-  };
-  return map[type] || 'corrida';
+  const map = { 'Run': 'Corrida', 'Walk': 'Caminhada', 'Ride': 'Bike' };
+  return map[type] || 'Corrida';
+}
+
+async function getValidToken() {
+  const refreshToken = process.env.STRAVA_REFRESH_TOKEN;
+  const res = await axios.post('https://www.strava.com/oauth/token', {
+    client_id: STRAVA_CLIENT_ID,
+    client_secret: STRAVA_CLIENT_SECRET,
+    grant_type: 'refresh_token',
+    refresh_token: refreshToken,
+  });
+  return res.data.access_token;
 }
 
 export default async function handler(req, res) {
 
-  // ── GET: verificação do webhook pelo Strava ──
   if (req.method === 'GET') {
     const mode = req.query['hub.mode'];
     const token = req.query['hub.verify_token'];
@@ -28,61 +32,48 @@ export default async function handler(req, res) {
     return res.status(403).json({ error: 'Forbidden' });
   }
 
-  // ── POST: nova atividade do Strava ──
   if (req.method === 'POST') {
     const event = req.body;
+    console.log('Evento recebido:', JSON.stringify(event));
 
-    // Só processa criação de atividades
     if (event.object_type !== 'activity' || event.aspect_type !== 'create') {
-      return res.status(200).json({ ok: true });
+      return res.status(200).json({ ok: true, msg: 'ignorado' });
     }
 
     try {
-      // 1. Busca token de acesso salvo
-      const accessToken = process.env.STRAVA_ACCESS_TOKEN;
-      const refreshToken = process.env.STRAVA_REFRESH_TOKEN;
+      // 1. Renova token do Strava
+      const stravaToken = await getValidToken();
+      console.log('Token Strava renovado com sucesso');
 
-      // 2. Busca detalhes da atividade no Strava
-      let token = accessToken;
-      try {
-        const refreshRes = await axios.post('https://www.strava.com/oauth/token', {
-          client_id: STRAVA_CLIENT_ID,
-          client_secret: STRAVA_CLIENT_SECRET,
-          grant_type: 'refresh_token',
-          refresh_token: refreshToken,
-        });
-        token = refreshRes.data.access_token;
-      } catch(e) {
-        console.error('Erro refresh token:', e.message);
-      }
-
+      // 2. Busca detalhes da atividade
       const actRes = await axios.get(
         `https://www.strava.com/api/v3/activities/${event.object_id}`,
-        { headers: { Authorization: `Bearer ${token}` } }
+        { headers: { Authorization: `Bearer ${stravaToken}` } }
       );
       const act = actRes.data;
+      console.log('Atividade:', act.type, act.name, act.moving_time);
 
-      // 3. Monta o treino no formato Mind Tracker
+      // 3. Monta treino no formato Mind Tracker
       const dateStr = act.start_date_local.split('T')[0];
       const tempo = Math.round(act.moving_time / 60);
       const km = act.distance ? parseFloat((act.distance / 1000).toFixed(2)) : null;
-      const tipo = mapAtividade(act.type);
 
       const novoTreino = {
         id: Date.now(),
         pessoa: 'esdras',
         data: dateStr,
         modalidade: 'cardio',
-        tipo: tipo === 'corrida' ? 'Corrida' : tipo === 'caminhada' ? 'Caminhada' : 'Bike',
+        tipo: mapAtividade(act.type),
         tempo,
         km,
         calorias: act.calories || Math.round(tempo * 8),
-        stravaId: event.object_id,
+        stravaId: String(event.object_id),
         stravaImportado: true,
         createdAt: new Date().toISOString(),
       };
+      console.log('Treino montado:', JSON.stringify(novoTreino));
 
-      // 4. Lê dados atuais do Google Drive
+      // 4. Lê dados do Google Drive com o token do ambiente
       const driveToken = process.env.GOOGLE_ACCESS_TOKEN;
       const fileId = process.env.GDRIVE_FILE_ID;
 
@@ -90,14 +81,17 @@ export default async function handler(req, res) {
         `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
         { headers: { Authorization: `Bearer ${driveToken}` } }
       );
-
       const db = driveRes.data;
+      console.log('Drive lido, treinos existentes:', db.treinos?.length);
 
-      // Evita duplicata
-      const jaExiste = (db.treinos || []).some(t => t.stravaId === event.object_id);
-      if (jaExiste) return res.status(200).json({ ok: true, msg: 'duplicata ignorada' });
+      // 5. Evita duplicata
+      const jaExiste = (db.treinos || []).some(t => t.stravaId === String(event.object_id));
+      if (jaExiste) {
+        console.log('Duplicata ignorada');
+        return res.status(200).json({ ok: true, msg: 'duplicata' });
+      }
 
-      // 5. Adiciona treino e salva de volta
+      // 6. Salva no Drive
       db.treinos = db.treinos || [];
       db.treinos.push(novoTreino);
 
@@ -112,12 +106,12 @@ export default async function handler(req, res) {
         }
       );
 
-      console.log(`✅ Treino importado: ${tipo} ${tempo}min ${km}km em ${dateStr}`);
+      console.log('✅ Treino salvo no Drive!');
       return res.status(200).json({ ok: true, treino: novoTreino });
 
     } catch (err) {
-      console.error('Erro webhook:', err.message);
-      return res.status(500).json({ error: err.message });
+      console.error('Erro webhook:', err.response?.data || err.message);
+      return res.status(500).json({ error: err.response?.data || err.message });
     }
   }
 
